@@ -37,6 +37,7 @@ services:
       LLM_MODEL:       ${LLM_MODEL:-gpt-4o-mini}
       PDF_DIR:         /data/pdfs
       LOG_LEVEL:       ${LOG_LEVEL:-info}
+      DOCTRINA_API_KEY: ${DOCTRINA_API_KEY:-}
     volumes:
       - ${PDF_HOST_DIR:-./pdfs}:/data/pdfs:ro   # PDFs descargados montados en solo lectura
     ports:

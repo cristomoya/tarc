@@ -1,19 +1,21 @@
 # main.py — FastAPI: búsqueda híbrida + chat RAG sobre resoluciones TACRC
 import asyncio
+import hmac
 import json
 import logging
 from typing import Optional, List
 import io
 import pdfplumber
-from fastapi import FastAPI, Depends, Query, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, Query, HTTPException, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from openai import AsyncOpenAI
 
+import doctrina
 from config import settings
-from db import get_db
+from db import AsyncSessionLocal, get_db
 
 logging.basicConfig(level=settings.log_level.upper())
 log = logging.getLogger(__name__)
@@ -804,13 +806,12 @@ async def riesgo_pliego(
             ))
             continue
 
-        # Calcular ratio de estimaciones (proxy de riesgo estadístico)
-        total     = len(rows)
-        estimadas = sum(
-            1 for r in rows
-            if r["sentido"] and "estimaci" in r["sentido"].lower()
-        )
-        ratio_estimaciones = estimadas / total if total else 0
+        # Ratio de estimaciones (proxy de riesgo estadístico), contando cada resolución una vez.
+        # No usar `"estimaci" in sentido`: también acierta en "Desestimación".
+        stats     = doctrina.estadisticas(rows)
+        total     = stats["total"]
+        estimadas = stats["estimadas"]
+        ratio_estimaciones = stats["ratio_estimacion"] or 0
 
         # Contexto para el LLM
         contexto_chunks = "\n---\n".join(
@@ -846,7 +847,7 @@ EXTRACTO DEL PLIEGO (cláusulas relevantes):
 DOCTRINA TACRC (resoluciones similares):
 {contexto_chunks}
 
-ESTADÍSTICA: De {total} resoluciones similares recuperadas, {estimadas} fueron estimadas (el TACRC anuló o corrigió).
+ESTADÍSTICA: De {total} resoluciones similares recuperadas, {estimadas} fueron estimadas total o parcialmente (el TACRC anuló o corrigió) y {stats['desestimadas']} desestimadas; el resto se inadmitió o archivó.
 
 Responde EXCLUSIVAMENTE con este JSON (sin markdown, sin explicación adicional):
 {{
@@ -957,6 +958,94 @@ indicando qué aspectos son más urgentes de revisar y por qué."""
         fuentes=list(fuentes_dict.values()),
         resumen=resumen,
     )
+
+
+# ── Endpoint: doctrina por hallazgo (solo recuperación, sin LLM) ──────────────
+# Lo usa pliego-analyzer: le envía los hallazgos de su cuestionario y decide el riesgo con su propio modelo.
+
+class HallazgoDoctrina(BaseModel):
+    id:       str = Field(..., max_length=100)
+    aspecto:  str = Field(..., min_length=3, max_length=1000)
+    clausula: str = ""                  # texto del pliego; se recorta para el embedding
+
+class DoctrinaRequest(BaseModel):
+    hallazgos: List[HallazgoDoctrina] = Field(..., max_length=15)
+    top_k:     int = Field(6, ge=1, le=12)
+
+class FragmentoDoctrina(BaseModel):
+    numero:  str
+    fecha:   Optional[str]
+    sentido: Optional[str]
+    texto:   str
+    pdf_url: Optional[str]
+    score:   float
+
+class DoctrinaHallazgo(BaseModel):
+    id:           str
+    fragmentos:   List[FragmentoDoctrina]
+    estadisticas: dict
+
+class DoctrinaResponse(BaseModel):
+    resultados: List[DoctrinaHallazgo]
+
+
+def check_api_key(x_api_key: Optional[str] = Header(None)):
+    """Si DOCTRINA_API_KEY está definida, exige la cabecera X-API-Key (la API no tiene otra autenticación)."""
+    if settings.doctrina_api_key and not hmac.compare_digest(x_api_key or "", settings.doctrina_api_key):
+        raise HTTPException(status_code=401, detail="X-API-Key incorrecta o ausente.")
+
+
+# Limita las consultas simultáneas a OpenAI y a la BD por petición de /doctrina.
+_DOCTRINA_CONCURRENCIA = 4
+
+
+async def _doctrina_hallazgo(h: HallazgoDoctrina, top_k: int, sem: asyncio.Semaphore) -> DoctrinaHallazgo:
+    consulta = f"{h.aspecto}\n{h.clausula[:1500]}".strip()
+    async with sem:
+        emb = await get_embedding(consulta)
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SET LOCAL statement_timeout = '20s'"))
+            # Patrón HNSW: ORDER BY distancia + LIMIT sin GROUP BY (ver CLAUDE.md)
+            rows = (await db.execute(text("""
+                SELECT r.id, r.numero, to_char(r.fecha, 'DD/MM/YYYY') AS fecha, r.sentido, r.pdf_url,
+                       c.texto
+                FROM chunks c
+                JOIN resoluciones r ON r.id = c.resolucion_id
+                WHERE c.embedding IS NOT NULL
+                ORDER BY c.embedding <=> (:emb)::vector
+                LIMIT :limit
+            """), {"emb": fmt_vector(emb), "limit": top_k * 3})).mappings().all()
+
+    rows = list(rows)
+    if RERANK_ENABLED and len(rows) > top_k:
+        passages = [{"id": i, "text": r["texto"]} for i, r in enumerate(rows)]
+        reranked = await asyncio.to_thread(reranker.rerank, RerankRequest(query=consulta[:1000], passages=passages))
+        rows = [rows[p["id"]] for p in reranked[:top_k]]
+    else:
+        rows = rows[:top_k]
+
+    return DoctrinaHallazgo(
+        id=h.id,
+        fragmentos=[
+            FragmentoDoctrina(
+                numero=r["numero"], fecha=r["fecha"], sentido=r["sentido"], texto=r["texto"],
+                pdf_url=r["pdf_url"], score=round(1 - i / max(len(rows), 1), 3),
+            )
+            for i, r in enumerate(rows)
+        ],
+        estadisticas=doctrina.estadisticas(rows),
+    )
+
+
+@app.post("/doctrina", response_model=DoctrinaResponse, dependencies=[Depends(check_api_key)])
+async def doctrina_hallazgos(req: DoctrinaRequest):
+    """
+    Recupera, para cada hallazgo de un pliego, los fragmentos de resoluciones más parecidos
+    (vector + reranker) y las estadísticas de sentido de esas resoluciones. No llama a ningún LLM.
+    """
+    sem = asyncio.Semaphore(_DOCTRINA_CONCURRENCIA)
+    resultados = await asyncio.gather(*(_doctrina_hallazgo(h, req.top_k, sem) for h in req.hallazgos))
+    return DoctrinaResponse(resultados=list(resultados))
 
 
 # ── Endpoint: seguimiento por aspecto ────────────────────────────────────────
