@@ -54,7 +54,11 @@ frontend (Streamlit :8501) ──httpx──> api (FastAPI :8003) ──asyncpg�
 - `/buscar` — Hybrid search: semantic (pgvector HNSW on chunks) + trigram (GIN on text fields), merged with Reciprocal Rank Fusion. Two modes: `semantico` (default) and `exacto`.
 - `/chat` — RAG: retrieves top-k chunks by vector distance → optional FlashRank reranking → GPT-4o-mini.
 - `/resoluciones/{numero}/resumen` — LLM-extracted structured fields from PDF text.
+- `/riesgo_pliego` — per-aspect risk of a PDF pliego (retrieval + GPT-4o-mini). Its estimation ratio comes from `doctrina.estadisticas`.
+- `/doctrina` — retrieval only, no LLM: for each finding `{id, aspecto, clausula}` (max 15) returns the top-k chunks (vector search + FlashRank rerank) and `estadisticas`. Used by pliego-analyzer, which rates the risk with Claude. Requires `X-API-Key` when `DOCTRINA_API_KEY` is set.
 - In-memory LRU cache (500 entries) for query embeddings to avoid redundant OpenAI calls.
+
+**`api/doctrina.py`** — pure functions (no DB/OpenAI): `clasificar_sentido` and `estadisticas`. Never test `"estimaci" in sentido`: it also matches "Desestimación". `estadisticas` counts each resolution once (several chunks of the same resolution are common) and computes `ratio_estimacion` over estimadas + desestimadas only. Tests: `cd api && pip install -r requirements-dev.txt && pytest tests/`.
 
 **`api/ingest.py`** — 4-step pipeline:
 1. Metadata UPSERT from JSON (Chrome extension export)
@@ -111,5 +115,6 @@ All configuration is via `.env`. Key variables:
 | `LLM_MODEL` | `gpt-4o-mini` | Chat and extraction model |
 | `POSTGRES_*` | tacrc/tacrc | DB credentials |
 | `APP_PASSWORD` | — | Frontend login gate |
+| `DOCTRINA_API_KEY` | — | If set, `/doctrina` requires header `X-API-Key` (shared with pliego-analyzer's `TARC_API_KEY`) |
 
 API port is `8003` (mapped from container's `8000`). DB port is `5433` (mapped from container's `5432`).

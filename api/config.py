@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     llm_model:      str   = "gpt-4o-mini"
     pdf_dir:        str   = "/data/pdfs"
     log_level:      str   = "info"
+    doctrina_api_key: str = ""        # si se define, /doctrina exige la cabecera X-API-Key
 
     class Config:
         env_file = ".env"
